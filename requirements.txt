@@ -1,1 +1,7 @@
 streamlit
+pdfplumber
+pandas
+json
+os
+zipfile
+io
