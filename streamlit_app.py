@@ -9,6 +9,9 @@ import zipfile
 import io
 import os
 
+service_account_info = st.secrets["gcp_service_account"]
+service_account_json = json.dumps(service_account_info)
+
 # Authenticate with service account
 def authenticate_with_service_account(key_path):
     credentials = service_account.Credentials.from_service_account_file(key_path)
@@ -231,5 +234,5 @@ def main():
             clear_session()
 
 if __name__ == "__main__":
-    authenticate_with_service_account('vision-419710-be168842e4c3.json')
+    authenticate_with_service_account(service_account_json)
     main()
