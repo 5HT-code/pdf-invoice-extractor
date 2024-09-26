@@ -1,155 +1,235 @@
 import streamlit as st
-import pdfplumber
-import pandas as pd
+import base64
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part, SafetySetting
+from google.oauth2 import service_account
 import json
-import os
+import pandas as pd
 import zipfile
-from io import BytesIO
+import io
+import os
 
-# Function to extract text from PDFs
-def extract_from_pdf(pdf_path):
-    all_text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            all_text += page.extract_text() or ""
-    return all_text
+# Authenticate with service account
+def authenticate_with_service_account(key_path):
+    credentials = service_account.Credentials.from_service_account_file(key_path)
+    vertexai.init(project="vision-419710", location="us-central1", credentials=credentials)
 
-# Function to analyze extracted text with Groq (mock implementation)
-def analyze_text_with_groq(text):
-    # Replace with actual API call to Groq when integrating
-    # Here, a mock JSON output is returned for demonstration
-    prompt = combined_prompt_invoice.format(text=text)
-    try:
-        completion = client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=2048,
-            top_p=1,
-            stream=False,
-            response_format={"type": "json_object"},
-            stop=None,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        st.error(f"Error occurred: {e}")
-        return None
+# Function to load and encode the PDF file
+def load_pdf_file(file):
+    pdf_data = file.read()
+    encoded_pdf = base64.b64encode(pdf_data).decode('utf-8')
+    return encoded_pdf
 
-# Function to create DataFrames from JSON data
-def create_dataframes(json_data):
-    try:
-        data = json.loads(json_data)
-        df_items = pd.DataFrame(data['Items'])
-        df_invoice = pd.DataFrame({
-            'Invoice Number': [data.get('Invoice Number', '')],
-            'Invoice Date': [data.get('Invoice date', '')],
-            'Place Of Supply': [data.get('Place Of Supply', '')],
-            'Place of Origin': [data.get('Place of Origin', '')],
-            'Receiver Name': [data.get('Receiver Name', '')],
-            'Taxable Value': [data.get('Taxable Value', 0)],
-            'Cgst Amount': [data.get('Cgst Amount', 0)],
-            'Sgst Amount': [data.get('Sgst Amount', 0)],
-            'Invoice Value': [data.get('Invoice Value', 0)],
-            'Rounding Adjustment': [data.get('Rounding Adjustment', 0)],
-            'GSTIN/UIN of Supplier': [data.get('GSTIN/UIN of Supplier', '')],
-            'GSTIN/UIN of Recipient': [data.get('GSTIN/UIN of Recipient', '')]
-        })
-        return df_items, df_invoice
-    except json.JSONDecodeError as e:
-        st.error(f"Error parsing JSON: {e}")
-        return None, None
-
-# Function to check accuracy
-def check_accuracy(df_invoice, df_items):
-    sum_total_amount = df_items['Total Amount'].sum()
-    sum_cgst_amount = df_items['Cgst amount'].sum()
-    sum_sgst_amount = df_items['Sgst amount'].sum()
-    invoice_total = df_invoice.at[0, 'Invoice Value']
-    rounding_adjustment = df_invoice.at[0, 'Rounding Adjustment']
-    sub_total = df_invoice.at[0, 'Taxable Value']
-    cgst_total = df_invoice.at[0, 'Cgst Amount']
-    sgst_total = df_invoice.at[0, 'Sgst Amount']
-    invoice_total_check = abs((invoice_total - rounding_adjustment) - sum_total_amount) < 0.01
-    sub_total_check = abs(sub_total - sum_total_amount) < 0.01
-    cgst_total_check = abs(cgst_total - sum_cgst_amount) < 0.01
-    sgst_total_check = abs(sgst_total - sum_sgst_amount) < 0.01
-    return all([invoice_total_check, sub_total_check, cgst_total_check, sgst_total_check])
-
-# Streamlit App Layout
-st.title("Invoice Processing and Accuracy Check")
-uploaded_files = st.file_uploader("Upload PDF invoices", type="pdf", accept_multiple_files=True)
-
-if uploaded_files:
-    progress_bar = st.progress(0)
-    total_files = len(uploaded_files)
-    passed_files = []
-    failed_files = []
-    invoice_data = []
-    item_data = []
-
-    for i, file in enumerate(uploaded_files):
-        extracted_text = extract_from_pdf(file)
-        formatted_data = analyze_text_with_groq(extracted_text)
-
-        if formatted_data:
-            df_items, df_invoice = create_dataframes(formatted_data)
-            if df_items is not None and df_invoice is not None:
-                if check_accuracy(df_invoice, df_items):
-                    passed_files.append(file.name)
-                    invoice_data.append(df_invoice)
-                    item_data.append(df_items)
-                else:
-                    failed_files.append(file.name)
-
-        # Update Progress
-        progress_bar.progress((i + 1) / total_files)
-        st.write(f"Files processed: {i + 1}/{total_files}")
-
-    # Zip passed and failed files
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w') as zipf:
-        for file_name in passed_files:
-            zipf.writestr(f"passed/{file_name}", open(file_name, 'rb').read())
-        for file_name in failed_files:
-            zipf.writestr(f"failed/{file_name}", open(file_name, 'rb').read())
+# Function to generate content using Vertex AI GenerativeModel
+def generate_invoice_extraction(file):
+    encoded_pdf = load_pdf_file(file)
+    document1 = Part.from_data(mime_type="application/pdf", data=encoded_pdf)
     
-    st.download_button(
-        label="Download Zipped Files",
-        data=zip_buffer.getvalue(),
-        file_name="processed_files.zip",
-        mime="application/zip"
+    textsi_1 = """You are tasked with extracting and organizing data from invoice PDFs. Ensure you infer values based on context and provide all requested fields in a structured format, even if labeled differently."""
+    
+    text1 = """Please extract the following information from the attached invoice PDF and return the results in JSON format:
+    Invoice Details:
+    invoice_number: The invoice number (e.g., \"Invoice No.\", \"Inv#\", etc.).
+    invoice_date: The date of the invoice (e.g., \"Date\", \"Invoice Date\").
+    due_date: The payment due date (e.g., \"Due Date\").
+    place_of_supply: The place of supply (e.g., \"recepient's state\").
+    place_of_origin: The supplier's origin (e.g., supplier's state).
+    receiver_name: The recipient\'s name (e.g., \"Billed To\").
+    gstin_supplier: The supplier's GSTIN.
+    gstin_recipient: The recipient\'s GSTIN, if available.
+    taxable_value: Amount before tax and after discount.
+    invoice_value: Amount after tax.
+    tax_amount: total tax amount.
+    Line Items:
+    For each item, extract:
+    item_name: The name or description of the item.
+    rate_per_item_after_discount: The cost after discounts.
+    quantity: The number of units/items.
+    taxable_value: The taxable value of the item.
+    sgst_amount, cgst_amount, igst_amount: Applicable tax amounts (if available).
+    sgst_rate, cgst_rate, igst_rate: Applicable tax rates (if available).
+    tax_amount: If CGST, SGST, and IGST amounts are not explicitly mentioned, extract the general tax amount.
+    tax_rate: If CGST, SGST, and IGST rates are not explicitly mentioned, extract the general tax rate.
+    final_amount: The final amount payable for the item.
+    Total Summary:
+    total_taxable_value: The sum of taxable values.
+    total_cgst_amount, total_sgst_amount, total_igst_amount: Sum all CGST, SGST, and IGST amounts if multiple tax rates are mentioned. For example, if the invoice states \"CGST @ 6% = ₹X\" and \"CGST @ 9% = ₹Y\", sum the amounts (X + Y) for a consolidated total CGST amount. Apply the same rule for SGST and IGST if applicable. Follow this method strictly.
+    total_tax_amount: If CGST, SGST, or IGST are not explicitly mentioned, extract and sum the general tax amount as total_tax_amount. Do not use this field if specific CGST, SGST, or IGST amounts are present.
+    total_invoice_value: Total invoice value after taxes.
+    rounding_adjustment: Any rounding adjustments.
+    Return the extracted data in JSON format."""
+
+    model = GenerativeModel("gemini-1.5-flash-002", system_instruction=textsi_1)
+
+    generation_config = {
+        "max_output_tokens": 8192,
+        "temperature": 0.2,
+        "top_p": 0.95,
+    }
+    
+    safety_settings = [
+        SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=SafetySetting.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
+        SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
+        SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
+        SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
+    ]
+
+    responses = model.generate_content(
+        [text1, document1],
+        generation_config=generation_config,
+        safety_settings=safety_settings,
+        stream=True,
     )
 
-    # Save and download CSV files
-    if invoice_data and item_data:
-        invoices_df = pd.concat(invoice_data, ignore_index=True)
-        items_df = pd.concat(item_data, ignore_index=True)
+    return responses
 
-        st.write("Invoices Data:")
-        st.dataframe(invoices_df)
+def check_accuracy(invoices_df, items_df):
+    invoices_df['invoice_value'] = pd.to_numeric(invoices_df['invoice_value'].astype(str).str.replace(',', ''), errors='coerce')
+    invoices_df['taxable_value'] = pd.to_numeric(invoices_df['taxable_value'].astype(str).str.replace(',', ''), errors='coerce')
+    
+    items_df['final_amount'] = pd.to_numeric(items_df['final_amount'].astype(str).str.replace(',', ''), errors='coerce')
+    items_df['taxable_value'] = pd.to_numeric(items_df['taxable_value'].astype(str).str.replace(',', ''), errors='coerce')
 
-        st.write("Items Data:")
-        st.dataframe(items_df)
+    invoices_invoice_value = invoices_df['invoice_value'].sum()
+    invoices_taxable_value = invoices_df['taxable_value'].sum()
 
-        csv_invoice = invoices_df.to_csv(index=False).encode('utf-8')
-        csv_items = items_df.to_csv(index=False).encode('utf-8')
+    items_invoice_value = items_df['final_amount'].sum()
+    items_taxable_value = items_df['taxable_value'].sum()
 
-        st.download_button(
-            label="Download Invoices CSV",
-            data=csv_invoice,
-            file_name="invoices.csv",
-            mime="text/csv"
-        )
-        st.download_button(
-            label="Download Items CSV",
-            data=csv_items,
-            file_name="items.csv",
-            mime="text/csv"
-        )
+    invoice_value_check = abs(invoices_invoice_value - items_invoice_value) < 1
+    taxable_value_check = abs(invoices_taxable_value - items_taxable_value) < 1
 
-    # Summary of results
-    st.write(f"Total files processed: {total_files}")
-    st.write(f"Files passed accuracy check: {len(passed_files)}")
-    st.write(f"Files failed accuracy check: {len(failed_files)}")
+    return invoice_value_check and taxable_value_check
+
+def combine_invoices_and_items_df(invoices_df, items_df):
+    new_df = items_df.copy()
+
+    new_df['invoice_number'] = invoices_df['invoice_number'][0]
+    new_df['invoice_date'] = invoices_df['invoice_date'][0]
+    new_df['place_of_supply'] = invoices_df['place_of_supply'][0]
+    new_df['place_of_origin'] = invoices_df['place_of_origin'][0]
+    new_df['gstin_supplier'] = invoices_df['gstin_supplier'][0]
+    new_df['gstin_recipient'] = invoices_df['gstin_recipient'][0]
+
+    numeric_columns = ['taxable_value', 'sgst_amount', 'cgst_amount', 'igst_amount', 'sgst_rate', 'cgst_rate', 'igst_rate', 'tax_amount', 'tax_rate', 'final_amount']
+    for col in numeric_columns:
+        new_df[col] = pd.to_numeric(new_df[col].astype(str).str.replace(',', ''), errors='coerce')
+    
+    new_df = new_df.drop(['item_name', 'rate_per_item_after_discount', 'quantity'], axis=1)
+
+    return new_df
+
+def process_file(file):
+    if 'processed_files' not in st.session_state:
+        st.session_state.processed_files = {}
+
+    if file.name in st.session_state.processed_files:
+        return st.session_state.processed_files[file.name]
+
+    responses = generate_invoice_extraction(file)
+    json_string = ''.join([response.text for response in responses])
+
+
+    json_string = json_string.replace('```', '').replace('json\n', '')
+
+    try:
+        invoice_dict = json.loads(json_string)
+
+
+        invoices_df = pd.DataFrame(invoice_dict['Invoice Details'], index=[0])
+        items_df = pd.DataFrame(invoice_dict['Line Items'])
+
+
+
+        accuracy_check = check_accuracy(invoices_df, items_df)
+
+        if accuracy_check:
+            new_df = combine_invoices_and_items_df(invoices_df, items_df)
+            st.session_state.processed_files[file.name] = {'status': 'passed', 'data': new_df}
+        else:
+            st.session_state.processed_files[file.name] = {'status': 'failed', 'data': file}
+
+    except json.JSONDecodeError:
+        st.session_state.processed_files[file.name] = {'status': 'failed', 'data': file}
+
+    return st.session_state.processed_files[file.name]
+
+def clear_session():
+    if 'uploaded_files' in st.session_state:
+        for file in st.session_state.uploaded_files:
+            file.close()
+    st.session_state.clear()
+    st.experimental_rerun()
+
+def main():
+    st.title("Invoice Data Extractor")
+
+    if 'uploaded_files' not in st.session_state:
+        st.session_state.uploaded_files = []
+
+    uploaded_files = st.file_uploader("Choose PDF files", accept_multiple_files=True, type="pdf")
+
+    if uploaded_files:
+        st.session_state.uploaded_files = uploaded_files
+
+    if st.session_state.uploaded_files:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        total_files = len(st.session_state.uploaded_files)
+        processed_files = 0
+        passed_files = 0
+        failed_files = 0
+
+        all_new_dfs = []
+        failed_files_list = []
+
+        for file in st.session_state.uploaded_files:
+            processed_files += 1
+            status_text.text(f"Processing file {processed_files} of {total_files}")
+
+            result = process_file(file)
+
+            if result['status'] == 'passed':
+                passed_files += 1
+                all_new_dfs.append(result['data'])
+            else:
+                failed_files += 1
+                failed_files_list.append(result['data'])
+
+            progress_bar.progress(processed_files / total_files)
+
+        if all_new_dfs:
+            combined_df = pd.concat(all_new_dfs, ignore_index=True)
+
+            csv = combined_df.to_csv(index=False)
+            st.download_button(
+                label="Download CSV for passed files",
+                data=csv,
+                file_name="passed_invoices.csv",
+                mime="text/csv",
+            )
+
+        if failed_files_list:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+                for file in failed_files_list:
+                    zip_file.writestr(file.name, file.getvalue())
+            
+            st.download_button(
+                label="Download ZIP of failed files",
+                data=zip_buffer.getvalue(),
+                file_name="failed_invoices.zip",
+                mime="application/zip",
+            )
+
+        st.write(f"Total files: {total_files}")
+        st.write(f"Files processed: {processed_files}")
+        st.write(f"Files passed accuracy check: {passed_files}")
+        st.write(f"Files failed accuracy check: {failed_files}")
+
+        if st.button("Clear Session and Start Over"):
+            clear_session()
+
+if __name__ == "__main__":
+    authenticate_with_service_account('vision-419710-be168842e4c3.json')
+    main()
